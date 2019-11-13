@@ -1,0 +1,416 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+our $VERSION = '0.001000';
+
+use File::Basename qw(basename dirname);
+use File::Spec::Functions qw(catdir catfile rel2abs abs2rel splitdir);
+use Cwd qw(abs_path);
+use File::Path qw(mkpath);
+use File::Find ();
+use Getopt::Long qw(:config gnu_getopt no_auto_abbrev no_ignore_case);
+
+GetOptions(
+  'h|help'         => sub {
+    require Pod::Usage;
+    Pod::Usage::pod2usage(-exitval => 0, -verbose => 1);
+  },
+  'V|version'      => sub {
+    print "distarify version $VERSION\n";
+    exit 0;
+  },
+) or exit 1;
+
+my $dist_dir = @ARGV ? shift @ARGV : '.';
+if (!-d $dist_dir) {
+  die "$dist_dir exists and is not a directory!";
+}
+$dist_dir = abs_path($dist_dir);
+my $dist_name = basename($dist_dir);
+
+my @modules;
+if (-e "$dist_dir/lib") {
+  File::Find::find({
+    no_chdir => 1,
+    wanted => sub {
+      return
+        if !-f;
+      push @modules, abs2rel($_, "$dist_dir/lib");
+    },
+  }, "$dist_dir/lib");
+}
+
+my @scripts;
+if (opendir my $dh, "$dist_dir/bin") {
+  @scripts = map "bin/$_", grep !/\A\./ && -f, readdir $dh;
+  closedir $dh;
+}
+@scripts = sort @scripts;
+
+my $main_package;
+my $main_module;
+if (@modules) {
+  my ($module) = sort { length($a) <=> length($b) || $a cmp $b } @modules;
+
+  $main_module = "lib/$module";
+
+  $main_package = $module;
+  $main_package =~ s/\.pm\z//;
+  $main_package = join '::', splitdir($main_package);
+}
+elsif (@scripts == 1) {
+  $main_package = "App-$scripts[0]";
+  $main_module = $main_package;
+  $main_module =~ s{::}{/}g;
+  $main_module = "lib/$main_module.pm";
+}
+else {
+  $main_package = $dist_name;
+  $main_package =~ s{-}{::}g;
+  $main_module = $main_package;
+  $main_module =~ s{::}{/}g;
+  $main_module = "lib/$main_module.pm";
+}
+
+my $config_file = ($ENV{XDG_CONFIG_HOME} || "$ENV{HOME}/.config") . '/distarify';
+my %config;
+if (open my $fh, '<', $config_file) {
+  while (my $line = <$fh>) {
+    chomp $line;
+    next
+      if $line =~ /\A\s*(?:#.*)?\z/;
+
+    my ($key, $value) = split /=/, $line, 2;
+    s/\A\s+//, s/\s+\z// for $key, $value;
+    $config{$key} = $value;
+  }
+}
+
+my $github_user = $config{github_user};
+my $cpan_user = $config{cpan_user};
+my $author = $config{author};
+
+if (!$github_user || !$cpan_user || !$author) {
+  die <<END_ERROR;
+config file ($config_file) is incomplete!
+
+Example:
+author = haarg - Graham Knop (cpan:HAARG) <haarg\@haarg.org>
+github_user = haarg
+cpan_user = HAARG
+
+END_ERROR
+}
+
+sub spew {
+  my ($file, $content) = @_;
+  open my $fh, '>', $file
+    or die "can't open $file: $!";
+  print { $fh } $content
+    or die "can't write to $file: $!";
+  close $fh
+    or die "can't close $file: $!";
+}
+
+{
+  my $templates;
+  sub templates {
+    if (!$templates) {
+      $templates = read_sections(\*DATA);
+      close DATA;
+    }
+    return $templates;
+  }
+}
+
+sub read_sections {
+  my $fh = shift;
+  my %sections;
+  my $data;
+  while (my $line = <$fh>) {
+    if ($line =~ /^__\[\s*(\S+?)\s*\]__\n/m) {
+      $data = \($sections{$1} = "");
+    }
+    elsif (!$data) {
+      die "bad data in template!";
+    }
+    else {
+      $$data .= $line
+    }
+  }
+  return \%sections;
+}
+
+mkpath($dist_dir);
+chdir $dist_dir;
+
+my $templates = templates();
+for my $file (sort keys %$templates) {
+  my $full_path = catfile($dist_dir, $file);
+  if (!-e $full_path) {
+    mkpath(dirname($full_path));
+    my $template = $templates->{$file};
+    $template =~ s/(?:[ \t]*\[\%-|\[\%)(.*?)(?:-\%\][ \t]*\n?|\%\])/$1/eeg;
+    spew $full_path, $template;
+  }
+}
+
+mkpath(dirname($main_module));
+my $fh;
+my $content = '';
+if (open $fh, '+<', $main_module) {
+  $content = do { local $/; <$fh> };
+  seek $fh, 0, 0;
+}
+else {
+  undef $fh;
+}
+
+my $new_content = $content;
+if ($new_content =~ s{^([ \t]*)((?:our\s*)?\$VERSION\s*=.*\n)(?:\s*\$VERSION\s*=(?:\s*eval\s*\$VERSION\s*;\n|~\s*tr/_//d;\n))?\n*}{$1$2$1\$VERSION =~ tr/_//d;\n\n}m) {
+  # ok
+}
+else {
+  $new_content =~ s{\A(?:package\s+\Q$main_package\E;\n|use strict;\n|use warnings;\n|\n)*}{package $main_package;\nuse strict;\nuse warnings;\n\nour \$VERSION = '0.001000';\n\$VERSION =~ tr/_//d;\n\n};
+}
+
+my $pod = '';
+while ($new_content =~ s/\n*(^=\w+(.*?)(?:^=cut\n+|\z))/\n/ms) {
+  my $new_pod = $1;
+  $new_pod =~ s/\A\n+//;
+  $new_pod =~ s/\n*(?:=cut\n*)?\z/\n/;
+  $pod .= ($pod ? "\n" : '') . $new_pod;
+}
+
+$new_content =~ s/(?:\n+1;)?(?:\n+__END__)?\n*\z/\n\n1;\n__END__\n\n/;
+
+my $pre_pod = '';
+my $post_pod = '';
+if ($pod =~ s/^(=head1 NAME\n.*?\n)(?==head1\b|\z)//ms) {
+  $pre_pod .= $1;
+  $pre_pod =~ s/\n*\z/\n\n/;
+}
+else {
+  $pre_pod .= "=head1 NAME\n\n$main_package - A new module\n\n";
+}
+
+if ($pod =~ s/^(=head1 SYNOPSIS\n.*?\n)(?==head1\b|\z)//ms) {
+  $pre_pod .= $1;
+  $pre_pod =~ s/\n*\z/\n\n/;
+}
+else {
+  $pre_pod .= "=head1 SYNOPSIS\n\n  use $main_package;\n\n";
+}
+
+if ($pod =~ s/^(=head1 DESCRIPTION\n.*?\n)(?==head1\b|\z)//ms) {
+  $pre_pod .= $1;
+  $pre_pod =~ s/\n*\z/\n\n/;
+}
+else {
+  $pre_pod .= "=head1 DESCRIPTION\n\nA new module.\n\n";
+}
+
+my $author_sec = 'AUTHOR';
+if ($pod =~ s/^(=head1 (AUTHORS?)\n.*?\n)(?==head1\b|\z)//ms) {
+  $author_sec = $2;
+  $post_pod .= $1;
+  $post_pod =~ s/\n*\z/\n\n/;
+}
+else {
+  $post_pod .= "=head1 AUTHOR\n\n$author\n\n";
+}
+
+if ($pod =~ s/^(=head1 CONTRIBUTORS\n.*?\n)(?==head1\b|\z)//ms) {
+  $post_pod .= $1;
+  $post_pod =~ s/\n*\z/\n\n/;
+}
+else {
+  $post_pod .= "=head1 CONTRIBUTORS\n\nNone so far.\n\n";
+}
+
+if ($pod =~ s/^(=head1 COPYRIGHT\n.*?\n)(?==head1\b|\z)//ms) {
+  $post_pod .= $1;
+  $post_pod =~ s/\n*\z/\n\n/;
+}
+else {
+  my $year = (localtime)[5] + 1900;
+  $post_pod .= "=head1 COPYRIGHT\n\nCopyright (c) $year the $main_package L</$author_sec> and L</CONTRIBUTORS>\nas listed above.\n\n";
+}
+
+if ($pod =~ s/^(=head1 LICEN[SC]E\n.*?\n)(?==head1\b|\z)//ms) {
+  $post_pod .= $1;
+  $post_pod =~ s/\n*\z/\n\n/;
+}
+else {
+  $post_pod .= "=head1 LICENSE\n\nThis library is free software and may be distributed under the same terms\nas perl itself. See L<https://dev.perl.org/licenses/>.\n\n";
+}
+
+$post_pod .= "=cut\n";
+
+$new_content .= $pre_pod . $pod . $post_pod;
+
+if (!$fh) {
+  open $fh, '>', $main_module
+    or die "can't open $main_module: $!";;
+}
+
+truncate $fh, 0;
+print $fh $new_content;
+close $fh;
+
+if (!-e '.git') {
+  system qw(git init);
+  system qw(git add .);
+  system qw(git commit -m), 'Initial commit';
+}
+
+=head1 SYNOPSIS
+
+  distarify [ -h ] [ -v ]
+
+=cut
+
+__DATA__
+__[ Changes ]__
+Revision history for [% $dist_name %]
+
+  - initial release
+__[ Makefile.PL ]__
+use strict;
+use warnings FATAL => 'all';
+use 5.006;
+
+my %META = (
+  name => '[% $dist_name %]',
+  license => 'perl_5',
+  prereqs => {
+    configure => { requires => {
+      'ExtUtils::MakeMaker'   => 0,
+    } },
+    build => { requires => {
+    } },
+    test => {
+      requires => {
+        'Test::More'  => '0.88',
+      },
+    },
+    runtime => {
+      requires => {
+      },
+    },
+    develop   => {
+      requires => {
+      },
+    },
+  },
+  resources => {
+    repository => {
+      url => 'https://github.com/[% $github_user %]/[% $dist_name %].git',
+      web => 'https://github.com/[% $github_user %]/[% $dist_name %]',
+      type => 'git',
+    },
+    bugtracker => {
+      web => 'https://rt.cpan.org/Public/Dist/Display.html?Name=[% $dist_name %]',
+      mailto => 'bug-[% $dist_name %]@rt.cpan.org',
+    },
+    license => [ 'http://dev.perl.org/licenses/' ],
+  },
+  no_index => {
+    directory => [ 't', 'xt' ]
+  },
+  x_breaks => {
+  },
+  x_authority => 'cpan:[% $cpan_user %]',
+);
+
+my %MM_ARGS = ([%
+if (@scripts) {
+  "\n    EXE_FILES => [\n"
+  . (map "        '$_'\n", @scripts)
+  . "    ],\n";
+}
+%]);
+
+## BOILERPLATE ###############################################################
+require ExtUtils::MakeMaker;
+(do './maint/Makefile.PL.include' or die $@) unless -f 'META.yml';
+
+# have to do this since old EUMM dev releases miss the eval $VERSION line
+my $eumm_version  = eval $ExtUtils::MakeMaker::VERSION;
+my $mymeta        = $eumm_version >= 6.57_02;
+my $mymeta_broken = $mymeta && $eumm_version < 6.57_07;
+
+($MM_ARGS{NAME} = $META{name}) =~ s/-/::/g;
+($MM_ARGS{VERSION_FROM} = "lib/$MM_ARGS{NAME}.pm") =~ s{::}{/}g;
+$META{license} = [ $META{license} ]
+  if $META{license} && !ref $META{license};
+$MM_ARGS{LICENSE} = $META{license}[0]
+  if $META{license} && $eumm_version >= 6.30;
+$MM_ARGS{NO_MYMETA} = 1
+  if $mymeta_broken;
+$MM_ARGS{META_ADD} = { 'meta-spec' => { version => 2 }, %META }
+  unless -f 'META.yml';
+$MM_ARGS{PL_FILES} ||= {};
+$MM_ARGS{NORECURS} = 1
+  if not exists $MM_ARGS{NORECURS};
+
+for (qw(configure build test runtime)) {
+  my $key = $_ eq 'runtime' ? 'PREREQ_PM' : uc $_.'_REQUIRES';
+  my $r = $MM_ARGS{$key} = {
+    %{$META{prereqs}{$_}{requires} || {}},
+    %{delete $MM_ARGS{$key} || {}},
+  };
+  defined $r->{$_} or delete $r->{$_} for keys %$r;
+}
+
+$MM_ARGS{MIN_PERL_VERSION} = delete $MM_ARGS{PREREQ_PM}{perl} || 0;
+
+delete $MM_ARGS{MIN_PERL_VERSION}
+  if $eumm_version < 6.47_01;
+$MM_ARGS{BUILD_REQUIRES} = {%{$MM_ARGS{BUILD_REQUIRES}}, %{delete $MM_ARGS{TEST_REQUIRES}}}
+  if $eumm_version < 6.63_03;
+$MM_ARGS{PREREQ_PM} = {%{$MM_ARGS{PREREQ_PM}}, %{delete $MM_ARGS{BUILD_REQUIRES}}}
+  if $eumm_version < 6.55_01;
+delete $MM_ARGS{CONFIGURE_REQUIRES}
+  if $eumm_version < 6.51_03;
+
+ExtUtils::MakeMaker::WriteMakefile(%MM_ARGS);
+## END BOILERPLATE ###########################################################
+__[ .gitignore ]__
+/MANIFEST
+/MANIFEST.bak
+/MANIFEST.SKIP
+/META.*
+/MYMETA.*
+/Makefile
+/Makefile.old
+/README
+/blib/
+/pm_to_blib
+/Distar
+/cover_db/
+/_eumm/
+*~
+*#
+.#*
+/[% $dist_name %]-*/
+/[% $dist_name %]-*.tar.gz
+__[ maint/Makefile.PL.include ]__
+BEGIN { -e 'Distar' or system("git clone git://github.com/p5sagit/Distar") }
+use lib 'Distar/lib';
+use Distar 0.001;
+
+author '[% $author %]';
+
+1;
+__[ t/basic.t ]__
+use strict;
+use warnings;
+use Test::More;
+
+use [% $main_package %];
+
+ok 1;
+
+done_testing;
