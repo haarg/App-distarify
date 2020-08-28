@@ -151,7 +151,7 @@ for my $file (sort keys %$templates) {
   if (!-e $full_path) {
     mkpath(dirname($full_path));
     my $template = $templates->{$file};
-    $template =~ s/(?:[ \t]*\[\%-|\[\%)(.*?)(?:-\%\][ \t]*\n?|\%\])/$1/eeg;
+    $template =~ s/(?:[ \t]*\[\%-|\[\%)(.*?)(?:-\%\][ \t]*\n?|\%\])/$1/eegs;
     spew $full_path, $template;
   }
 }
