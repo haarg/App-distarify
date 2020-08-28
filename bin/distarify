@@ -43,10 +43,9 @@ if (-e "$dist_dir/lib") {
 
 my @scripts;
 if (opendir my $dh, "$dist_dir/bin") {
-  @scripts = map "bin/$_", grep !/\A\./ && -f, readdir $dh;
+  @scripts = sort grep -f, map "bin/$_", grep !/\A\./, readdir $dh;
   closedir $dh;
 }
-@scripts = sort @scripts;
 
 my $main_package;
 my $main_module;
@@ -325,11 +324,11 @@ my %META = (
 );
 
 my %MM_ARGS = ([%
-if (@scripts) {
-  "\n    EXE_FILES => [\n"
-  . (map "        '$_'\n", @scripts)
-  . "    ],\n";
-}
+@scripts ? join('',
+  "\n    EXE_FILES => [\n",
+  (map "        '$_',\n", @scripts),
+  "    ],\n",
+) : ''
 %]);
 
 ## BOILERPLATE ###############################################################
